@@ -330,11 +330,15 @@ async def dispatch_loop(queue: asyncio.Queue, clients: list, delay_seconds: floa
         bytes_in_window += len(data)
         window_elapsed = time.monotonic() - report_window_start
         if window_elapsed >= THROUGHPUT_REPORT_INTERVAL:
+            current_lag = time.monotonic() - arrival_time
             log.info(
-                "Dispatch throughput: %.1f items/s, %.0f bytes/s over the last %.1fs",
+                "Dispatch throughput: %.1f items/s, %.0f bytes/s over the last %.1fs "
+                "-- currently %.1fs behind live (started at %.1fs)",
                 items_in_window / window_elapsed,
                 bytes_in_window / window_elapsed,
                 window_elapsed,
+                current_lag,
+                delay_seconds,
             )
             report_window_start = time.monotonic()
             items_in_window = 0
