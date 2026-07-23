@@ -286,6 +286,7 @@ async def dispatch_loop(queue: asyncio.Queue, clients: list, delay_seconds: floa
     last_sent_arrival = None
     warp_ticks = 0
     nominal_gap = None  # learned typical healthy inter-item spacing, i.e. the stream's own pace
+    next_send_time = None  # token-bucket schedule for send pacing, see below
 
     report_window_start = time.monotonic()
     items_in_window = 0
@@ -312,14 +313,18 @@ async def dispatch_loop(queue: asyncio.Queue, clients: list, delay_seconds: floa
             primed = True
         elif last_sent_arrival is not None:
             real_gap = max(arrival_time - last_sent_arrival, 0)
-            wait = min(real_gap, GAP_CAP_SECONDS)
-            skipped = real_gap - wait
+
+            # Track how much dead time we're choosing not to reproduce, purely for
+            # PCR/PTS/DTS restamping (see _restamp_chunk) -- this is about metadata
+            # correctness and is independent of the actual send pacing below.
+            capped_wait = min(real_gap, GAP_CAP_SECONDS)
+            skipped = real_gap - capped_wait
             if skipped > 0:
                 warp_ticks += round(skipped * PCR_TICKS_PER_SEC)
                 log.info(
                     "Dispatch: capped a %.2fs gap to %.2fs (skipped %.2fs, cumulative warp %.2fs) -- visible to OBS now",
                     real_gap,
-                    wait,
+                    capped_wait,
                     skipped,
                     warp_ticks / PCR_TICKS_PER_SEC,
                 )
@@ -329,15 +334,31 @@ async def dispatch_loop(queue: asyncio.Queue, clients: list, delay_seconds: floa
                     NOMINAL_GAP_SMOOTHING * nominal_gap + (1 - NOMINAL_GAP_SMOOTHING) * real_gap
                 )
 
-            if nominal_gap is not None:
-                # Never send faster than the stream's own learned pace, even when
-                # there's backlog to drain. OBS can only consume at roughly that
-                # rate anyway (it plays back near real-time); trying to deliver
-                # faster just backs up in the TCP send buffer and blocks
-                # writer.drain() for hundreds of ms, which is worse than the
-                # pause it was meant to hide (confirmed via the CPU timing log:
-                # send= spikes to 500-1300ms exactly when items/s spikes).
-                wait = max(wait, nominal_gap)
+            # Actual send pacing: a token-bucket scheduler ticking forward at exactly
+            # nominal_gap per item, NOT a reproduction of real_gap and NOT a floor
+            # compared against it (an earlier version floored every wait at
+            # nominal_gap, which only ever pulls below-average gaps up and never lets
+            # above-average gaps compensate -- a one-sided bias that made dispatch
+            # run persistently slower than the stream's true average rate). A
+            # schedule that just advances by a fixed amount per item has no such
+            # bias: it holds early items back to their slot and lets late items
+            # through immediately, so it settles at exactly the nominal rate on
+            # average. GAP_CAP_SECONDS doubles as the burst allowance, capping how
+            # much "catch-up credit" can accumulate so a stall's backlog gets
+            # drained at the nominal rate afterward, not raced through -- racing
+            # doesn't make OBS play back faster (it decodes near real-time
+            # regardless), it just backs up in the TCP send buffer and blocks
+            # writer.drain() for hundreds of ms (confirmed via the CPU timing log).
+            if nominal_gap is None:
+                wait = capped_wait
+            else:
+                now = time.monotonic()
+                if next_send_time is None:
+                    next_send_time = now
+                next_send_time = max(next_send_time, now - GAP_CAP_SECONDS)
+                wait = max(next_send_time - now, 0)
+                next_send_time = max(next_send_time, now) + nominal_gap
+
             if wait > 0:
                 await asyncio.sleep(wait)
 
