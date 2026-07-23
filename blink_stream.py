@@ -59,6 +59,7 @@ READ_IDLE_TIMEOUT = 20  # seconds of no video data before treating the connectio
 NULL_TS_PACKET = bytes([0x47, 0x1F, 0xFF, 0x10]) + bytes([0xFF] * 184)
 KEEPALIVE_INTERVAL = 0.5  # seconds between null packets while no real data is due
 GAP_CAP_SECONDS = 0.05  # max visible pause per item during steady-state playback; backlog absorbs the rest
+THROUGHPUT_REPORT_INTERVAL = 3  # seconds between "Dispatch throughput" log lines
 
 TS_PACKET_SIZE = 188
 PCR_TICKS_PER_SEC = 90_000  # PCR base, PTS, and DTS all tick at 90kHz
@@ -284,6 +285,10 @@ async def dispatch_loop(queue: asyncio.Queue, clients: list, delay_seconds: floa
     last_sent_arrival = None
     warp_ticks = 0
 
+    report_window_start = time.monotonic()
+    items_in_window = 0
+    bytes_in_window = 0
+
     while True:
         try:
             arrival_time, data = await asyncio.wait_for(queue.get(), KEEPALIVE_INTERVAL)
@@ -304,6 +309,13 @@ async def dispatch_loop(queue: asyncio.Queue, clients: list, delay_seconds: floa
             skipped = real_gap - wait
             if skipped > 0:
                 warp_ticks += round(skipped * PCR_TICKS_PER_SEC)
+                log.info(
+                    "Dispatch: capped a %.2fs gap to %.2fs (skipped %.2fs, cumulative warp %.2fs) -- visible to OBS now",
+                    real_gap,
+                    wait,
+                    skipped,
+                    warp_ticks / PCR_TICKS_PER_SEC,
+                )
             if wait > 0:
                 await asyncio.sleep(wait)
 
@@ -313,6 +325,20 @@ async def dispatch_loop(queue: asyncio.Queue, clients: list, delay_seconds: floa
         except Exception:
             log.exception("Failed to restamp chunk, sending it unmodified")
         await _send_to_clients(clients, data)
+
+        items_in_window += 1
+        bytes_in_window += len(data)
+        window_elapsed = time.monotonic() - report_window_start
+        if window_elapsed >= THROUGHPUT_REPORT_INTERVAL:
+            log.info(
+                "Dispatch throughput: %.1f items/s, %.0f bytes/s over the last %.1fs",
+                items_in_window / window_elapsed,
+                bytes_in_window / window_elapsed,
+                window_elapsed,
+            )
+            report_window_start = time.monotonic()
+            items_in_window = 0
+            bytes_in_window = 0
 
 
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, clients: list) -> None:
