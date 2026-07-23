@@ -348,6 +348,12 @@ async def dispatch_loop(queue: asyncio.Queue, clients: list, delay_seconds: floa
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, clients: list) -> None:
     peer = writer.get_extra_info("peername")
     log.info("Client connected: %s", peer)
+    sock = writer.get_extra_info("socket")
+    if sock is not None:
+        # Disable Nagle's algorithm: we send frequent small (~1316-byte) chunks, which
+        # is exactly the pattern Nagle's coalescing (plus delayed-ACK on the far end)
+        # can silently stall for tens to hundreds of ms per write.
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     clients.append(writer)
     try:
         while not writer.is_closing():
