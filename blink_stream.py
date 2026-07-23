@@ -59,8 +59,9 @@ READ_IDLE_TIMEOUT = 20  # seconds of no video data before treating the connectio
 NULL_TS_PACKET = bytes([0x47, 0x1F, 0xFF, 0x10]) + bytes([0xFF] * 184)
 KEEPALIVE_INTERVAL = 0.5  # seconds between null packets while no real data is due
 GAP_CAP_SECONDS = 0.05  # max visible pause per item during steady-state playback; backlog absorbs the rest
-REPLENISH_FRACTION = 0.1  # during healthy periods, wait up to this much extra (as a fraction of the
-# real gap) to slowly rebuild the delay cushion after gap-capping has spent it absorbing a stall
+REPLENISH_FRACTION = 0.1  # correct the delay cushion toward target by up to this fraction of the real
+# gap per item -- both rebuilding it after a stall and trimming it back if it drifts over target
+REPLENISH_DEADBAND_SECONDS = 1.0  # ignore lag deviation from target smaller than this (measurement/processing noise)
 THROUGHPUT_REPORT_INTERVAL = 3  # seconds between "Dispatch throughput" log lines
 
 TS_PACKET_SIZE = 188
@@ -308,7 +309,19 @@ async def dispatch_loop(queue: asyncio.Queue, clients: list, delay_seconds: floa
         elif last_sent_arrival is not None:
             real_gap = max(arrival_time - last_sent_arrival, 0)
             wait = min(real_gap, GAP_CAP_SECONDS)
-            skipped = real_gap - wait
+
+            # Two-sided correction toward delay_seconds, with a deadband so ordinary
+            # per-item processing jitter doesn't trigger constant tiny corrections.
+            # Without the downward side, that jitter only ever gets "fixed" upward
+            # (nudge up when under target, do nothing when over) and the lag ratchets
+            # away from delay_seconds indefinitely instead of settling near it.
+            deficit = delay_seconds - (time.monotonic() - arrival_time)
+            if deficit > REPLENISH_DEADBAND_SECONDS:
+                wait += min(deficit, real_gap * REPLENISH_FRACTION)
+            elif deficit < -REPLENISH_DEADBAND_SECONDS:
+                wait = max(wait - min(-deficit, real_gap * REPLENISH_FRACTION), 0)
+
+            skipped = max(real_gap - wait, 0)
             if skipped > 0:
                 warp_ticks += round(skipped * PCR_TICKS_PER_SEC)
                 log.info(
@@ -318,12 +331,6 @@ async def dispatch_loop(queue: asyncio.Queue, clients: list, delay_seconds: floa
                     skipped,
                     warp_ticks / PCR_TICKS_PER_SEC,
                 )
-            else:
-                # Healthy transition -- if the cushion has been spent absorbing past stalls,
-                # nudge the wait up slightly to slowly rebuild it back toward delay_seconds.
-                deficit = delay_seconds - (time.monotonic() - arrival_time)
-                if deficit > 0:
-                    wait += min(deficit, real_gap * REPLENISH_FRACTION)
             if wait > 0:
                 await asyncio.sleep(wait)
 
