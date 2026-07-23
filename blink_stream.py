@@ -22,6 +22,12 @@ reappearing --buffer-seconds later. An outage that drains the whole
 cushion still shows up as a real pause. The local server itself stays up
 across upstream reconnects, so OBS only needs to connect once.
 
+Absorbed gaps are also removed from the stream's own embedded clock (PCR
+and PTS/DTS in each TS packet are shifted by the same accumulated amount),
+so the demuxer sees a steady clock instead of a stall-then-catch-up, which
+is what otherwise shows up as a brief rate wobble even after the gap
+itself is hidden. See _restamp_chunk.
+
 In OBS: Add Source -> Media Source -> uncheck "Local File" -> Input:
 tcp://<printed-address>:8554 -> Input Format: mpegts
 
@@ -53,6 +59,10 @@ READ_IDLE_TIMEOUT = 20  # seconds of no video data before treating the connectio
 NULL_TS_PACKET = bytes([0x47, 0x1F, 0xFF, 0x10]) + bytes([0xFF] * 184)
 KEEPALIVE_INTERVAL = 0.5  # seconds between null packets while no real data is due
 GAP_CAP_SECONDS = 0.2  # max visible pause per item during steady-state playback; backlog absorbs the rest
+
+TS_PACKET_SIZE = 188
+PCR_TICKS_PER_SEC = 90_000  # PCR base, PTS, and DTS all tick at 90kHz
+TIMESTAMP_MOD = 1 << 33  # PCR base, PTS, and DTS all wrap at 33 bits
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logging.getLogger("blinkpy").setLevel(logging.WARNING)
@@ -157,6 +167,85 @@ async def ingest_loop(camera, camera_name: str, queue: asyncio.Queue) -> None:
         await asyncio.sleep(3)
 
 
+def _rewrite_pcr(packet, offset: int, warp_ticks: int) -> None:
+    base = (
+        (packet[offset] << 25)
+        | (packet[offset + 1] << 17)
+        | (packet[offset + 2] << 9)
+        | (packet[offset + 3] << 1)
+        | (packet[offset + 4] >> 7)
+    )
+    ext = ((packet[offset + 4] & 0x1) << 8) | packet[offset + 5]
+    new_base = (base - warp_ticks) % TIMESTAMP_MOD
+    packet[offset] = (new_base >> 25) & 0xFF
+    packet[offset + 1] = (new_base >> 17) & 0xFF
+    packet[offset + 2] = (new_base >> 9) & 0xFF
+    packet[offset + 3] = (new_base >> 1) & 0xFF
+    packet[offset + 4] = ((new_base & 0x1) << 7) | 0x7E | ((ext >> 8) & 0x1)
+    packet[offset + 5] = ext & 0xFF
+
+
+def _rewrite_timestamp(packet, offset: int, warp_ticks: int) -> None:
+    value = (
+        ((packet[offset] >> 1) & 0x07) << 30
+        | packet[offset + 1] << 22
+        | ((packet[offset + 2] >> 1) & 0x7F) << 15
+        | packet[offset + 3] << 7
+        | ((packet[offset + 4] >> 1) & 0x7F)
+    )
+    new_value = (value - warp_ticks) % TIMESTAMP_MOD
+    marker = packet[offset] & 0xF1  # keep the 4-bit prefix and marker bit, replace the timestamp bits
+    packet[offset] = marker | (((new_value >> 30) & 0x07) << 1)
+    packet[offset + 1] = (new_value >> 22) & 0xFF
+    packet[offset + 2] = (((new_value >> 15) & 0x7F) << 1) | 0x1
+    packet[offset + 3] = (new_value >> 7) & 0xFF
+    packet[offset + 4] = ((new_value & 0x7F) << 1) | 0x1
+
+
+def _restamp_ts_packet(packet, warp_ticks: int) -> None:
+    """Subtract warp_ticks (90kHz ticks) from a TS packet's PCR/PTS/DTS, if present.
+
+    warp_ticks is the running total of upstream dead time the dispatcher has
+    chosen not to reproduce (see GAP_CAP_SECONDS in dispatch_loop). Shifting
+    every clock reference in the stream by the same amount preserves their
+    original relative timing (so audio/video stay in sync) while removing the
+    stall's real-time footprint, which is what actually causes a demuxer to
+    treat a stall/catch-up as a clock discontinuity and produce visible jank.
+    """
+    if packet[0] != 0x47:
+        return
+
+    payload_unit_start = bool(packet[1] & 0x40)
+    adaptation_field_control = (packet[3] >> 4) & 0x3
+    payload_offset = 4
+
+    if adaptation_field_control in (2, 3):
+        af_length = packet[4]
+        if af_length > 0:
+            flags = packet[5]
+            if flags & 0x10 and af_length >= 7:  # PCR_flag
+                _rewrite_pcr(packet, 6, warp_ticks)
+        payload_offset = 5 + af_length
+
+    if adaptation_field_control in (1, 3) and payload_unit_start:
+        if payload_offset + 9 <= TS_PACKET_SIZE and bytes(packet[payload_offset : payload_offset + 3]) == b"\x00\x00\x01":
+            pts_dts_flags = (packet[payload_offset + 7] >> 6) & 0x3
+            ts_offset = payload_offset + 9
+            if pts_dts_flags & 0x2 and ts_offset + 5 <= TS_PACKET_SIZE:
+                _rewrite_timestamp(packet, ts_offset, warp_ticks)
+                if pts_dts_flags == 0x3 and ts_offset + 10 <= TS_PACKET_SIZE:
+                    _rewrite_timestamp(packet, ts_offset + 5, warp_ticks)
+
+
+def _restamp_chunk(data: bytes, warp_ticks: int) -> bytes:
+    if warp_ticks == 0 or len(data) % TS_PACKET_SIZE != 0:
+        return data
+    packet_bytes = bytearray(data)
+    for offset in range(0, len(packet_bytes), TS_PACKET_SIZE):
+        _restamp_ts_packet(memoryview(packet_bytes)[offset : offset + TS_PACKET_SIZE], warp_ticks)
+    return bytes(packet_bytes)
+
+
 async def _send_to_clients(clients: list, data: bytes) -> None:
     for writer in list(clients):
         if writer.is_closing():
@@ -185,9 +274,15 @@ async def dispatch_loop(queue: asyncio.Queue, clients: list, delay_seconds: floa
 
     Idles (queue genuinely empty, cushion exhausted) are filled with null
     TS packets (see NULL_TS_PACKET) rather than silence.
+
+    Every skipped gap also accumulates into warp_ticks, which is subtracted
+    from each packet's PCR/PTS/DTS before it's sent (see _restamp_chunk) so
+    the stream's own embedded clock reflects what we actually deliver rather
+    than Blink's original (stall-inclusive) timing.
     """
     primed = False
     last_sent_arrival = None
+    warp_ticks = 0
 
     while True:
         try:
@@ -204,11 +299,19 @@ async def dispatch_loop(queue: asyncio.Queue, clients: list, delay_seconds: floa
                     await _send_to_clients(clients, NULL_TS_PACKET)
             primed = True
         elif last_sent_arrival is not None:
-            wait = min(max(arrival_time - last_sent_arrival, 0), GAP_CAP_SECONDS)
+            real_gap = max(arrival_time - last_sent_arrival, 0)
+            wait = min(real_gap, GAP_CAP_SECONDS)
+            skipped = real_gap - wait
+            if skipped > 0:
+                warp_ticks += round(skipped * PCR_TICKS_PER_SEC)
             if wait > 0:
                 await asyncio.sleep(wait)
 
         last_sent_arrival = arrival_time
+        try:
+            data = _restamp_chunk(data, warp_ticks)
+        except Exception:
+            log.exception("Failed to restamp chunk, sending it unmodified")
         await _send_to_clients(clients, data)
 
 
