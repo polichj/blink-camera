@@ -288,13 +288,18 @@ async def dispatch_loop(queue: asyncio.Queue, clients: list, delay_seconds: floa
     report_window_start = time.monotonic()
     items_in_window = 0
     bytes_in_window = 0
+    get_time = 0.0
+    restamp_time = 0.0
+    send_time = 0.0
 
     while True:
+        t0 = time.perf_counter()
         try:
             arrival_time, data = await asyncio.wait_for(queue.get(), KEEPALIVE_INTERVAL)
         except asyncio.TimeoutError:
             await _send_to_clients(clients, NULL_TS_PACKET)
             continue
+        get_time += time.perf_counter() - t0
 
         if not primed:
             target_time = arrival_time + delay_seconds
@@ -320,11 +325,16 @@ async def dispatch_loop(queue: asyncio.Queue, clients: list, delay_seconds: floa
                 await asyncio.sleep(wait)
 
         last_sent_arrival = arrival_time
+        t0 = time.perf_counter()
         try:
             data = _restamp_chunk(data, warp_ticks)
         except Exception:
             log.exception("Failed to restamp chunk, sending it unmodified")
+        restamp_time += time.perf_counter() - t0
+
+        t0 = time.perf_counter()
         await _send_to_clients(clients, data)
+        send_time += time.perf_counter() - t0
 
         items_in_window += 1
         bytes_in_window += len(data)
@@ -333,16 +343,24 @@ async def dispatch_loop(queue: asyncio.Queue, clients: list, delay_seconds: floa
             current_lag = time.monotonic() - arrival_time
             log.info(
                 "Dispatch throughput: %.1f items/s, %.0f bytes/s over the last %.1fs "
-                "-- currently %.1fs behind live (started at %.1fs)",
+                "-- currently %.1fs behind live (started at %.1fs) "
+                "-- CPU time: get=%.0fms restamp=%.0fms send=%.0fms (of %.0fms window)",
                 items_in_window / window_elapsed,
                 bytes_in_window / window_elapsed,
                 window_elapsed,
                 current_lag,
                 delay_seconds,
+                get_time * 1000,
+                restamp_time * 1000,
+                send_time * 1000,
+                window_elapsed * 1000,
             )
             report_window_start = time.monotonic()
             items_in_window = 0
             bytes_in_window = 0
+            get_time = 0.0
+            restamp_time = 0.0
+            send_time = 0.0
 
 
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, clients: list) -> None:
