@@ -59,6 +59,7 @@ READ_IDLE_TIMEOUT = 20  # seconds of no video data before treating the connectio
 NULL_TS_PACKET = bytes([0x47, 0x1F, 0xFF, 0x10]) + bytes([0xFF] * 184)
 KEEPALIVE_INTERVAL = 0.5  # seconds between null packets while no real data is due
 GAP_CAP_SECONDS = 0.05  # max visible pause per item during steady-state playback; backlog absorbs the rest
+NOMINAL_GAP_SMOOTHING = 0.98  # EMA factor for learning the stream's typical healthy inter-item spacing
 THROUGHPUT_REPORT_INTERVAL = 3  # seconds between "Dispatch throughput" log lines
 
 TS_PACKET_SIZE = 188
@@ -284,6 +285,7 @@ async def dispatch_loop(queue: asyncio.Queue, clients: list, delay_seconds: floa
     primed = False
     last_sent_arrival = None
     warp_ticks = 0
+    nominal_gap = None  # learned typical healthy inter-item spacing, i.e. the stream's own pace
 
     report_window_start = time.monotonic()
     items_in_window = 0
@@ -321,6 +323,21 @@ async def dispatch_loop(queue: asyncio.Queue, clients: list, delay_seconds: floa
                     skipped,
                     warp_ticks / PCR_TICKS_PER_SEC,
                 )
+            elif real_gap <= GAP_CAP_SECONDS * 2:
+                # Healthy transition -- learn the stream's natural pace from it.
+                nominal_gap = real_gap if nominal_gap is None else (
+                    NOMINAL_GAP_SMOOTHING * nominal_gap + (1 - NOMINAL_GAP_SMOOTHING) * real_gap
+                )
+
+            if nominal_gap is not None:
+                # Never send faster than the stream's own learned pace, even when
+                # there's backlog to drain. OBS can only consume at roughly that
+                # rate anyway (it plays back near real-time); trying to deliver
+                # faster just backs up in the TCP send buffer and blocks
+                # writer.drain() for hundreds of ms, which is worse than the
+                # pause it was meant to hide (confirmed via the CPU timing log:
+                # send= spikes to 500-1300ms exactly when items/s spikes).
+                wait = max(wait, nominal_gap)
             if wait > 0:
                 await asyncio.sleep(wait)
 
