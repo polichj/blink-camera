@@ -58,7 +58,7 @@ READ_IDLE_TIMEOUT = 20  # seconds of no video data before treating the connectio
 # silent, which can otherwise trip a demuxer's own idle/discontinuity handling.
 NULL_TS_PACKET = bytes([0x47, 0x1F, 0xFF, 0x10]) + bytes([0xFF] * 184)
 KEEPALIVE_INTERVAL = 0.5  # seconds between null packets while no real data is due
-GAP_CAP_SECONDS = 0.2  # max visible pause per item during steady-state playback; backlog absorbs the rest
+GAP_CAP_SECONDS = 0.05  # max visible pause per item during steady-state playback; backlog absorbs the rest
 
 TS_PACKET_SIZE = 188
 PCR_TICKS_PER_SEC = 90_000  # PCR base, PTS, and DTS all tick at 90kHz
