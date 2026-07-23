@@ -33,24 +33,40 @@ login prompt.
 The script prints something like:
 
 ```
-Streaming at tcp://127.0.0.1:8554 (point OBS/ffplay here)
+Streaming (buffered 20.0s behind live) at tcp://192.168.1.50:8554 (point OBS/ffplay here)
 ```
 
 and keeps running, automatically re-requesting a fresh live view session
-if the stream ever drops.
+if the stream ever drops. The local server itself stays up across those
+reconnects — OBS only needs to connect once.
 
-Optional flags: `--host` and `--port` to change the local bind address
-(default `127.0.0.1:8554`).
+Output is buffered up to `--buffer-seconds` (default `20`) behind real
+time. Blink's live view periodically drops or stalls; the buffer holds a
+cushion of already-received footage so those gaps get absorbed rather than
+replayed — a stall shorter than the buffered cushion becomes invisible to
+viewers instead of showing up `--buffer-seconds` later. An outage that
+drains the whole cushion still shows up as a real pause. Raise
+`--buffer-seconds` for more resilience at the cost of more lag, or lower it
+for less lag.
+
+By default it binds to `0.0.0.0`, so the stream is reachable both from
+this machine and from other machines on your LAN (e.g. a separate
+OBS/capture-card PC) — the printed address reflects whichever applies.
+Pass `--host 127.0.0.1` to restrict it to this machine only. `--port`
+changes the bind port (default `8554`).
 
 ## OBS setup
 
 Add Source → Media Source → uncheck "Local File" → Input:
-`tcp://127.0.0.1:8554` → Input Format: `mpegts`.
+`tcp://<printed-address>:8554` → Input Format: `mpegts`.
+
+If OBS is on a different machine than the script, make sure Windows
+Firewall (or your OS firewall) allows inbound TCP on that port.
 
 To sanity-check the stream is flowing before wiring up OBS:
 
 ```bash
-ffplay -f mpegts tcp://127.0.0.1:8554
+ffplay -f mpegts tcp://<printed-address>:8554
 ```
 
 ## Notes
