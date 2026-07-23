@@ -59,8 +59,6 @@ READ_IDLE_TIMEOUT = 20  # seconds of no video data before treating the connectio
 NULL_TS_PACKET = bytes([0x47, 0x1F, 0xFF, 0x10]) + bytes([0xFF] * 184)
 KEEPALIVE_INTERVAL = 0.5  # seconds between null packets while no real data is due
 GAP_CAP_SECONDS = 0.05  # max visible pause per item during steady-state playback; backlog absorbs the rest
-REPLENISH_FRACTION = 0.1  # during healthy periods, wait up to this much extra (as a fraction of the
-# real gap) to slowly rebuild the delay cushion after gap-capping has spent it absorbing a stall
 THROUGHPUT_REPORT_INTERVAL = 3  # seconds between "Dispatch throughput" log lines
 
 TS_PACKET_SIZE = 188
@@ -318,12 +316,6 @@ async def dispatch_loop(queue: asyncio.Queue, clients: list, delay_seconds: floa
                     skipped,
                     warp_ticks / PCR_TICKS_PER_SEC,
                 )
-            else:
-                # Healthy transition -- if the cushion has been spent absorbing past stalls,
-                # nudge the wait up slightly to slowly rebuild it back toward delay_seconds.
-                deficit = delay_seconds - (time.monotonic() - arrival_time)
-                if deficit > 0:
-                    wait += min(deficit, real_gap * REPLENISH_FRACTION)
             if wait > 0:
                 await asyncio.sleep(wait)
 
